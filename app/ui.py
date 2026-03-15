@@ -1,5 +1,6 @@
 import customtkinter as ctk
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from .downloader import download_audio, get_video_info
 from .database import add_entry, get_all_history
 
@@ -8,187 +9,245 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 class MusicItemFrame(ctk.CTkFrame):
-    def __init__(self, master, title, **kwargs):
-        # Cor de fundo mais próxima do painel do macOS
+    def __init__(self, master, title, vid_id, remove_callback, **kwargs):
         super().__init__(master, fg_color="#2D2D2D", corner_radius=12, **kwargs)
-        
         self.grid_columnconfigure(0, weight=1)
         
-        # Título da música (SF Pro Style)
-        self.title_label = ctk.CTkLabel(
-            self, text=title[:55] + "...", 
-            font=("Helvetica Neue", 13, "bold"), 
-            anchor="w", text_color="#FFFFFF"
-        )
+        # Título
+        self.title_label = ctk.CTkLabel(self, text=title[:55] + "...", 
+                                      font=("Helvetica Neue", 13, "bold"), anchor="w")
         self.title_label.grid(row=0, column=0, padx=(15, 10), pady=(12, 2), sticky="ew")
         
-        # Badge de Status/Tamanho
-        self.info_label = ctk.CTkLabel(
-            self, text="Pendente", 
-            font=("Helvetica Neue", 11), 
-            text_color="#A0A0A0"
-        )
-        self.info_label.grid(row=0, column=1, padx=15, pady=(12, 2), sticky="e")
+        # Info Status
+        self.info_label = ctk.CTkLabel(self, text="Aguardando...", font=("Helvetica Neue", 11), text_color="#A0A0A0")
+        self.info_label.grid(row=0, column=1, padx=5, pady=(12, 2), sticky="e")
+
+        # Botão Remover (X)
+        self.remove_btn = ctk.CTkButton(self, text="✕", width=28, height=28, fg_color="transparent", 
+                                       hover_color="#FF3B30", text_color="#707070",
+                                       command=lambda: remove_callback(vid_id))
+        self.remove_btn.grid(row=0, column=2, rowspan=2, padx=10, pady=5)
         
-        # Barra de progresso fina e moderna
-        self.progress_bar = ctk.CTkProgressBar(
-            self, height=6, progress_color="#007AFF", # Azul clássico da Apple
-            fg_color="#454545", border_width=0
-        )
+        # Barra de progresso
+        self.progress_bar = ctk.CTkProgressBar(self, height=6, progress_color="#007AFF", fg_color="#454545")
         self.progress_bar.set(0)
         self.progress_bar.grid(row=1, column=0, columnspan=2, padx=15, pady=(5, 15), sticky="ew")
 
-    def update_progress(self, percent_str, size_str):
+    def update_progress(self, percent_str, speed, size_str):
         try:
-            if "Convertendo" in percent_str or "99%" in percent_str:
-                self.progress_bar.configure(progress_color="#FF9500") # Laranja Apple para processamento
-                self.info_label.configure(text="Finalizando MP3...", text_color="#FF9500")
+            if "Convertendo" in percent_str or "99" in percent_str:
+                self.progress_bar.configure(progress_color="#FF9500")
+                self.info_label.configure(text="Processando MP3...", text_color="#FF9500")
                 self.progress_bar.set(0.99)
             else:
                 p = float(percent_str.replace('%', '')) / 100
                 self.progress_bar.set(p)
-                self.info_label.configure(text=f"{size_str} • {percent_str}")
-        except:
-            pass
+                self.info_label.configure(text=f"{size_str} • {percent_str}", text_color="#A0A0A0")
+        except: pass
 
     def set_finished(self):
         self.progress_bar.set(1.0)
-        self.progress_bar.configure(progress_color="#28C840") # Verde Apple
-        self.info_label.configure(text="Salvo com sucesso ✅", text_color="#28C840")
+        self.progress_bar.configure(progress_color="#28C840")
+        self.info_label.configure(text="Concluído ✅", text_color="#28C840")
+        self.remove_btn.configure(state="disabled")
+
+    def set_error(self):
+        self.progress_bar.set(1.0)
+        self.progress_bar.configure(progress_color="#FF3B30")
+        self.info_label.configure(text="Falhou ❌", text_color="#FF3B30")
 
 class MainUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("NGMP3 Pro")
-        self.geometry("850x680")
-        self.configure(fg_color="#1E1E1E") # Fundo Dark Mode macOS
+        self.geometry("900x720")
+        self.configure(fg_color="#1E1E1E")
         
         self.queue_data = []
         self.queue_frames = {}
+        self.is_running = False
 
         # --- Header ---
         self.header = ctk.CTkFrame(self, fg_color="transparent")
-        self.header.pack(fill="x", padx=30, pady=(30, 10))
+        self.header.pack(fill="x", padx=30, pady=(25, 10))
         
-        ctk.CTkLabel(self.header, text="NGMP3", font=("Helvetica Neue", 28, "bold"), text_color="#FFFFFF").pack(side="left")
-        ctk.CTkLabel(self.header, text="DOWNLOADER", font=("Helvetica Neue", 12, "bold"), 
-                    text_color="#007AFF", fg_color="#162D46", corner_radius=6, padx=8).pack(side="left", padx=15)
+        ctk.CTkLabel(self.header, text="NGMP3", font=("Helvetica Neue", 28, "bold")).pack(side="left")
+        
+        # Stats Badges
+        self.stats_frame = ctk.CTkFrame(self.header, fg_color="transparent")
+        self.stats_frame.pack(side="right")
+        self.count_waiting = self.create_stat_badge("Fila", "#007AFF")
+        self.count_done = self.create_stat_badge("Ok", "#28C840")
+        self.count_error = self.create_stat_badge("Erro", "#FF3B30")
 
-        # --- Input Bar (Floating Style) ---
+        # --- Input ---
         self.input_container = ctk.CTkFrame(self, fg_color="#2D2D2D", corner_radius=12, height=55)
-        self.input_container.pack(fill="x", padx=30, pady=20)
+        self.input_container.pack(fill="x", padx=30, pady=15)
         self.input_container.pack_propagate(False)
         
-        self.url_entry = ctk.CTkEntry(
-            self.input_container, placeholder_text="Cole o link do YouTube aqui...", 
-            border_width=0, fg_color="transparent", font=("Helvetica Neue", 14),
-            placeholder_text_color="#707070"
-        )
+        self.url_entry = ctk.CTkEntry(self.input_container, placeholder_text="URL do vídeo ou playlist...", 
+                                     border_width=0, fg_color="transparent", font=("Helvetica Neue", 14))
         self.url_entry.pack(side="left", fill="x", expand=True, padx=15)
         
-        self.add_btn = ctk.CTkButton(
-            self.input_container, text="Analisar", width=100, height=32, 
-            font=("Helvetica Neue", 12, "bold"), corner_radius=8,
-            fg_color="#007AFF", hover_color="#005BBF", command=self.add_to_queue
-        )
+        self.add_btn = ctk.CTkButton(self.input_container, text="Analisar", width=90, height=30, 
+                                    fg_color="#333333", hover_color="#444444", command=self.add_to_queue)
         self.add_btn.pack(side="right", padx=12)
 
         # --- Tabs ---
-        self.tabview = ctk.CTkTabview(self, fg_color="transparent", segmented_button_fg_color="#2D2D2D",
-                                     segmented_button_selected_color="#007AFF",
-                                     segmented_button_selected_hover_color="#005BBF")
+        self.tabview = ctk.CTkTabview(self, fg_color="transparent", segmented_button_selected_color="#007AFF")
         self.tabview.pack(fill="both", expand=True, padx=30)
-        self.tabview.add("Fila")
+        self.tabview.add("Downloads")
         self.tabview.add("Histórico")
 
-        # Fila
-        self.scroll_queue = ctk.CTkScrollableFrame(self.tabview.tab("Fila"), fg_color="transparent")
+        # Fila Scroll
+        self.scroll_queue = ctk.CTkScrollableFrame(self.tabview.tab("Downloads"), fg_color="transparent")
         self.scroll_queue.pack(fill="both", expand=True)
 
-        # Histórico
-        self.history_list = ctk.CTkTextbox(self.tabview.tab("Histórico"), font=("Helvetica Neue", 12), 
-                                         fg_color="#2D2D2D", border_width=0, corner_radius=12)
-        self.history_list.pack(fill="both", expand=True, pady=10)
+        # Histórico Scroll
+        self.scroll_history = ctk.CTkScrollableFrame(self.tabview.tab("Histórico"), fg_color="transparent")
+        self.scroll_history.pack(fill="both", expand=True)
 
-        # --- Control Bar ---
+        # --- Bottom Bar ---
         self.bottom_bar = ctk.CTkFrame(self, fg_color="transparent")
-        self.bottom_bar.pack(fill="x", padx=30, pady=30)
+        self.bottom_bar.pack(fill="x", padx=30, pady=25)
 
-        self.status_label = ctk.CTkLabel(self.bottom_bar, text="Pronto para iniciar", font=("Helvetica Neue", 12), text_color="#A0A0A0")
+        self.status_label = ctk.CTkLabel(self.bottom_bar, text="Aguardando link...", font=("Helvetica Neue", 12), text_color="#707070")
         self.status_label.pack(side="left")
 
-        self.dl_btn = ctk.CTkButton(
-            self.bottom_bar, text="Iniciar Downloads", height=42, width=180,
-            font=("Helvetica Neue", 14, "bold"), fg_color="#28C840", hover_color="#20A032",
-            corner_radius=10, command=self.start_thread
-        )
-        self.dl_btn.pack(side="right")
+        self.dl_btn = ctk.CTkButton(self.bottom_bar, text="Iniciar Downloads", height=42, width=160,
+                                   fg_color="#28C840", hover_color="#20A032", command=self.start_download_manager)
+        self.dl_btn.pack(side="right", padx=5)
+
+        self.stop_btn = ctk.CTkButton(self.bottom_bar, text="Parar", height=42, width=80,
+                                     fg_color="#333333", hover_color="#FF3B30", command=self.stop_process)
+        self.stop_btn.pack(side="right", padx=5)
         
         self.refresh_history()
 
+    def create_stat_badge(self, label, color):
+        f = ctk.CTkFrame(self.stats_frame, fg_color="#2D2D2D", corner_radius=8)
+        f.pack(side="left", padx=4)
+        ctk.CTkLabel(f, text=label, font=("Helvetica Neue", 9, "bold"), text_color=color).pack(padx=8, pady=(2, 0))
+        val = ctk.CTkLabel(f, text="0", font=("Helvetica Neue", 13, "bold"))
+        val.pack(padx=8, pady=(0, 2))
+        return val
+
+    def update_stats(self):
+        done = sum(1 for item in self.queue_data if item.get('status') == 'done')
+        waiting = sum(1 for item in self.queue_data if item.get('status') == 'waiting')
+        error = sum(1 for item in self.queue_data if item.get('status') == 'error')
+        self.count_done.configure(text=str(done))
+        self.count_waiting.configure(text=str(waiting))
+        self.count_error.configure(text=str(error))
+
     def add_to_queue(self):
-        url = self.url_entry.get().strip()
-        if not url: return
+        # Captura o texto bruto da entrada
+        raw_input = self.url_entry.get().strip()
+        if not raw_input: return
+        
         self.status_label.configure(text="🔍 Analisando links...", text_color="#FF9500")
         
         def fetch():
-            try:
-                entries = get_video_info(url)
-                for entry in entries:
-                    video_id = entry.get('id', 'temp')
-                    title = entry.get('title', 'Vídeo sem título')
-                    
-                    item_data = {
-                        "url": f"https://www.youtube.com/watch?v={video_id}" if 'id' in entry else url,
-                        "title": title, "id": video_id
-                    }
-                    self.queue_data.append(item_data)
-                    self.after(0, lambda t=title, vid=video_id: self.create_item_widget(t, vid))
-                
-                self.after(0, lambda: self.status_label.configure(text=f"✨ {len(entries)} itens prontos", text_color="#28C840"))
-                self.url_entry.delete(0, 'end')
-            except Exception:
-                self.after(0, lambda: self.status_label.configure(text="❌ Erro no link", text_color="#FF3B30"))
+            # Lógica para separar por vírgula OU por quebra de linha
+            # Primeiro, trocamos vírgulas por espaços, depois quebras de linha por espaços
+            clean_input = raw_input.replace(',', ' ').replace('\n', ' ')
+            # Criamos uma lista de links únicos, removendo espaços vazios
+            urls = [u.strip() for u in clean_input.split() if u.strip().startswith('http')]
+            
+            if not urls:
+                self.after(0, lambda: self.status_label.configure(text="❌ Nenhum link válido encontrado", text_color="#FF3B30"))
+                return
+
+            total_added = 0
+            for url in urls:
+                try:
+                    entries = get_video_info(url)
+                    for entry in entries:
+                        vid_id = entry.get('id', 'temp')
+                        title = entry.get('title', 'Vídeo')
+                        
+                        # Evita duplicados na fila visual
+                        if vid_id not in self.queue_frames:
+                            self.queue_data.append({
+                                "url": url if len(entries) == 1 else f"https://youtube.com/watch?v={vid_id}", 
+                                "id": vid_id, 
+                                "status": "waiting"
+                            })
+                            self.after(0, lambda t=title, v=vid_id: self.create_item_widget(t, v))
+                            total_added += 1
+                except Exception as e:
+                    print(f"Erro ao processar {url}: {e}")
+
+            self.after(0, self.update_stats)
+            self.after(0, lambda n=total_added: self.status_label.configure(
+                text=f"✅ {n} novos itens na fila", text_color="#28C840"))
+            self.after(0, lambda: self.url_entry.delete(0, 'end'))
 
         threading.Thread(target=fetch, daemon=True).start()
 
-    def create_item_widget(self, title, video_id):
-        frame = MusicItemFrame(self.scroll_queue, title=title)
-        frame.pack(fill="x", pady=6)
-        self.queue_frames[video_id] = frame
+    def create_item_widget(self, title, vid_id):
+        frame = MusicItemFrame(self.scroll_queue, title=title, vid_id=vid_id, remove_callback=self.remove_from_queue)
+        frame.pack(fill="x", pady=5)
+        self.queue_frames[vid_id] = frame
+
+    def remove_from_queue(self, vid_id):
+        if vid_id in self.queue_frames:
+            self.queue_frames[vid_id].destroy()
+            del self.queue_frames[vid_id]
+            self.queue_data = [i for i in self.queue_data if i['id'] != vid_id]
+            self.update_stats()
+
+    def stop_process(self):
+        self.is_running = False
+        self.status_label.configure(text="🛑 Parando processamento...")
+
+    def start_download_manager(self):
+        if not self.is_running:
+            self.is_running = True
+            self.dl_btn.configure(state="disabled")
+            threading.Thread(target=self.run_pool, daemon=True).start()
+
+    def run_pool(self):
+        # Baixa 3 simultâneos para máxima velocidade sem travar
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = []
+            for item in self.queue_data:
+                if not self.is_running: break
+                if item['status'] == 'done': continue
+                
+                futures.append(executor.submit(self.task_download, item))
+            
+            for f in futures: f.result()
+        
+        self.after(0, self.finish_ui)
+
+    def task_download(self, item):
+        vid = item['id']
+        frame = self.queue_frames.get(vid)
+        try:
+            title = download_audio(item['url'], progress_callback=frame.update_progress)
+            item['status'] = 'done'
+            self.after(0, frame.set_finished)
+            add_entry(title, item['url'], "Sucesso")
+        except:
+            item['status'] = 'error'
+            self.after(0, frame.set_error)
+        self.after(0, self.update_stats)
+
+    def finish_ui(self):
+        self.is_running = False
+        self.dl_btn.configure(state="normal")
+        self.status_label.configure(text="✅ Processo finalizado", text_color="#28C840")
+        self.refresh_history()
 
     def refresh_history(self):
-        self.history_list.configure(state="normal")
-        self.history_list.delete("1.0", "end")
+        for widget in self.scroll_history.winfo_children(): widget.destroy()
         for item in get_all_history():
-            self.history_list.insert("end", f"  •  {item[0]}\n\n")
-        self.history_list.configure(state="disabled")
+            h = ctk.CTkFrame(self.scroll_history, fg_color="#262626", corner_radius=8)
+            h.pack(fill="x", pady=3)
+            ctk.CTkLabel(h, text=f"🎵 {item[0][:60]}...", font=("Helvetica Neue", 12)).pack(side="left", padx=15, pady=8)
+            ctk.CTkLabel(h, text=item[2], font=("Helvetica Neue", 10), text_color="#666666").pack(side="right", padx=15)
 
-    def start_thread(self):
-        threading.Thread(target=self.process_queue, daemon=True).start()
-
-    def process_queue(self):
-        self.dl_btn.configure(state="disabled", text="Processando...", fg_color="#555555")
-        
-        for item in self.queue_data:
-            vid = item['id']
-            frame = self.queue_frames.get(vid)
-            if not frame: continue
-
-            def progress_hook(p, speed, size):
-                if frame:
-                    self.after(0, lambda: frame.update_progress(p, size))
-
-            try:
-                # O código aguarda aqui até o FFmpeg terminar
-                title = download_audio(item['url'], progress_callback=progress_hook)
-                add_entry(title, item['url'], "Sucesso")
-                # Agora sim, o arquivo existe!
-                self.after(0, frame.set_finished)
-            except:
-                if frame: self.after(0, lambda: frame.info_label.configure(text="Erro ao converter ❌", text_color="#FF3B30"))
-            
-            self.refresh_history()
-            
-        self.status_label.configure(text="✅ Tudo concluído", text_color="#28C840")
-        self.dl_btn.configure(state="normal", text="Iniciar Downloads", fg_color="#28C840")
+if __name__ == "__main__":
+    app = MainUI()
+    app.mainloop()
