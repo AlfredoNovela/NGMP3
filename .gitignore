@@ -1,0 +1,12 @@
+# Ignorar a pasta onde as músicas são salvas
+downloads/
+
+# Ignorar o histórico local do banco de dados
+*.db
+
+# Arquivos temporários do Python
+__pycache__/
+*.pyc
+
+# Arquivos de sistema do Mac (aqueles que aparecem no teu desktop nas fotos)
+.DS_Store
